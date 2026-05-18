@@ -400,4 +400,176 @@ executor.ts: createCliExecutor()
 
 ---
 
+## 7. TCC 权限机制深度分析
+
+> 补充分析：为什么 AI agent 的 shell 中无法继承截图权限，以及 Claude Code 的真实应对策略。
+
+### 7.1 Claude Code 的 TCC 处理流程
+
+Claude Code **没有规避** TCC 继承限制，而是采用 **检测 → 引导 → 重启** 的直面策略。
+
+#### 第一步：提前检查（`hostAdapter.ts:47-54`）
+
+```typescript
+ensureOsPermissions: async () => {
+  const cu = requireComputerUseSwift()
+  const accessibility = cu.tcc.checkAccessibility()
+  const screenRecording = cu.tcc.checkScreenRecording()
+  return accessibility && screenRecording
+    ? { granted: true }
+    : { granted: false, accessibility, screenRecording }
+}
+```
+
+直接调用 Swift 原生模块的 `tcc.checkScreenRecording()`，检查**当前 Node.js 进程**是否被 TCC 允许截图。
+
+#### 第二步：`request_access` 触发 TCC 面板
+
+当权限不足时，`@ant/computer-use-mcp` 的 `request_access` handler 把 `tccState` 塞进 `CuPermissionRequest`，最终渲染出 TCC 权限面板（`ComputerUseApproval.tsx:25-198`）：
+
+```
+┌─────────────────────────────────────┐
+│ Computer Use needs macOS permissions │
+├─────────────────────────────────────┤
+│ Accessibility: ✗ not granted        │
+│ Screen Recording: ✗ not granted     │
+│                                     │
+│ Grant the missing permissions in    │
+│ System Settings, then select        │
+│ "Try again". macOS may require you  │
+│ to restart Claude Code after        │
+│ granting Screen Recording.          │
+│                                     │
+│ > Open System Settings → Accessibility  │
+│   Open System Settings → Screen Recording│
+│   Try again                          │
+└─────────────────────────────────────┘
+```
+
+选择后执行的命令：
+```typescript
+// Accessibility
+execFileNoThrow("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+
+// Screen Recording
+execFileNoThrow("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+```
+
+#### 第三步：授权后需要重启
+
+关键提示文字（`ComputerUseApproval.tsx:164`）：
+> "macOS may require you to restart Claude Code after granting Screen Recording."
+
+**这说明 Claude Code 明确接受 macOS TCC 的一个限制：授权后，已运行的进程可能仍然被拒绝，需要重启进程才能让新的 TCC 权限生效。**
+
+---
+
+### 7.2 为什么 agent shell "不能继承" TCC
+
+TCC 权限在 macOS 上的继承规则：
+
+| 场景 | TCC 身份 | 截图是否成功 |
+|---|---|---|
+| 用户直接打开 Terminal.app，运行 Swift CLI | Terminal.app（`com.apple.Terminal`） | ✅ Terminal.app 有权限即可 |
+| VS Code 集成终端运行 Swift CLI | VS Code（`com.microsoft.VSCode`） | ✅ VS Code 有权限即可 |
+| SSH 登录到 macOS，运行 Swift CLI | sshd（无 GUI Bundle ID） | ❌ 几乎不可能 |
+| AI agent 通过 PTY/spawn 启动 shell | 取决于 agent 的启动方式 | ⚠️ 可能丢失 TCC 上下文 |
+
+Claude Code 能工作是因为它**运行在用户的本地终端 emulator 中**（iTerm2、Terminal.app、VS Code 终端等），这些终端本身通常已经被用户授予了 Screen Recording 权限。Claude Code 的 Node.js 进程作为终端的子进程，继承了相同的 TCC 上下文。
+
+但你的 agent shell 可能出现以下问题：
+
+#### 情况 A：Agent 通过非终端方式启动
+
+如果 agent（如 Kimi Code CLI、某个自动化工具）是通过 `launchd`、SSH、或某个 headless 进程启动的，那么 `__CFBundleIdentifier` 环境变量可能为空，或者指向一个没有 GUI 权限的进程。
+
+Claude Code 检测终端 Bundle ID 的方式（`common.ts:43-47`）：
+
+```typescript
+export function getTerminalBundleId(): string | null {
+  const cfBundleId = process.env.__CFBundleIdentifier
+  if (cfBundleId) return cfBundleId
+  return TERMINAL_BUNDLE_ID_FALLBACK[env.terminal ?? ''] ?? null
+}
+```
+
+**注意**：Claude Code 读取 `__CFBundleIdentifier` 主要是为了 `prepareDisplay` 的 `surrogateHost`（豁免终端窗口不被隐藏），而不是为了 TCC 截图权限本身。
+
+#### 情况 B：TCC 数据库中没有记录
+
+macOS TCC 是**按 Bundle ID + 代码签名**记录的。如果你的 Swift CLI 是一个没有 Bundle ID 的裸二进制（没有 `Info.plist`），macOS 甚至不知道应该向用户请求哪个应用的权限。
+
+#### 情况 C：权限已授予但进程需要重启
+
+macOS TCC 的一个已知行为：即使用户在系统设置里勾选了权限，**正在运行的进程仍然会被拒绝**，直到进程重启。Claude Code 的解决方式就是提示用户 "restart Claude Code"。
+
+---
+
+### 7.3 可能的解决方案
+
+#### 方案 1：把 Swift CLI 包装成 .app Bundle（推荐）
+
+macOS TCC 最友好的对象是 `.app` bundle：
+
+1. 用 `Swift Package Manager` 或 `Xcode` 把 CLI 包装成一个 `.app`
+2. 在 `Info.plist` 中设置 `CFBundleIdentifier`（如 `com.yourname.computer-use`）
+3. 用 `CGPreflightScreenCaptureAccess()` 或 `AXIsProcessTrusted()` 预先检查
+4. 第一次运行时，系统会弹出 TCC 对话框请求权限
+
+这样 TCC 权限就绑定到你的 app 的 Bundle ID 上，不再依赖终端的继承。
+
+#### 方案 2：利用终端的权限（Claude Code 方式）
+
+如果 CLI 必须通过终端运行，确保 TCC 上下文存在：
+
+```bash
+# 检查当前进程的 TCC 上下文
+echo $__CFBundleIdentifier
+# 应该输出类似 com.apple.Terminal / com.googlecode.iterm2 / com.microsoft.VSCode
+```
+
+如果 `__CFBundleIdentifier` 为空，说明 TCC 上下文丢失。手动设置通常**无效**，因为底层 TCC 检查的是实际代码签名身份，而不是环境变量。
+
+#### 方案 3：用 AppleScript 触发系统弹窗
+
+在 Swift 中：
+```swift
+import CoreGraphics
+
+let hasAccess = CGPreflightScreenCaptureAccess()
+if !hasAccess {
+    CGRequestScreenCaptureAccess()  // 触发 TCC 弹窗
+}
+```
+
+但这只会弹窗一次。如果用户之前点过 "拒绝"，macOS 不会再次弹窗。需要手动重置 TCC 数据库：
+
+```bash
+# 重置 ScreenCapture 权限记录
+sudo tccutil reset ScreenCapture
+```
+
+#### 方案 4：使用 `screencapture` 命令行工具（Fallback）
+
+macOS 自带的 `/usr/sbin/screencapture` 有特殊的系统级豁免：
+
+```bash
+screencapture -x /tmp/screenshot.png
+```
+
+但无法进行应用级过滤（`SCContentFilter`），且是全屏截图。
+
+---
+
+### 7.4 总结
+
+| 问题 | Claude Code 的做法 | 你自己实现时的建议 |
+|---|---|---|
+| TCC 权限不足 | `ensureOsPermissions` 检查 → TUI 引导用户去系统设置 → 提示重启 | 包装成 `.app` Bundle，让 TCC 有明确的授权目标 |
+| 权限继承丢失 | 依赖本地终端 emulator 的 TCC 上下文 | 确保 agent 从已授权的终端（Terminal/iTerm2/VS Code）启动 |
+| 授权后不生效 | 明确提示 "restart Claude Code" | 同样需要在授权后重启进程 |
+| 无 Bundle ID 的 CLI | N/A（Claude Code 是 Node.js 进程，继承终端权限） | 裸二进制 CLI 很难被 TCC 正确识别，建议包成 .app |
+
+---
+
 *本文仅供学习研究使用。*
